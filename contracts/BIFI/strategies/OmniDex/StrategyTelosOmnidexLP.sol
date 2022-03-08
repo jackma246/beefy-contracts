@@ -2,65 +2,66 @@
 
 pragma solidity ^0.6.0;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/math/SafeMath.sol";
 
-import "../../interfaces/common/IUniswapRouterETH.sol";
-import "../../interfaces/common/IUniswapV2Pair.sol";
-import "../../interfaces/sushi/IRewarder.sol";
-import "../../interfaces/sushi/IMiniChefV2.sol";
+import "../../interfaces/omnidex/IOmnidexRouter01.sol";
+import "../../interfaces/omnidex/IOmnidexPair.sol";
+import "../../interfaces/omnidex/IZenMaster.sol";
 import "../Common/StratManager.sol";
 import "../Common/FeeManager.sol";
 
 
-// Commented for my own clarity
-
 // Example use case: 
-// Polygon Network
-// beefy.finance
-// Vault - BCT-USDC SLP
+// Telos Network
+// Vault - omni-USDT-USDC-LP
 
 // Strategy:
 
-// 1. Deposit BCT-USDC-SLP, BCT, or USDC. In return, a mooBCT-USDC-SLP token is given to the user as a receipt.
-// 2. If deposit wasn't in BCT-USDC-SLP, need to zap the deposit into equal parts, to get the SLP token.
-// 3. SLP is the sushi liquidity pool token, the receipt for the liquidity provided. In this case, it's BCT-USDC LP.
-// 4. The BCT-USDC-SLP token is then put into the SushiSwap Farm to be staked to earn rewards
-// 5. The rewards will compound in the farm and the strategy will continue to harvest whenever it is profitable or when a new deposit enters the vault.
-//    New deposits pay for the gas for the harvest based on 
-// 6. At any point in time, the user can withdraw from the vault. Since the vault has been autocompounding rewards, the mooBCT-USDC-SLP token will not be 1:1 with the SLP token.
+// 1. Deposit USDT-USDC-LP. In return, a moo-USDT-USDC-LP token is given to the user as a receipt.
+// 2. The USDT-USDC-LP token is then put into the OmniDex Farm to be staked to earn rewards
+// 3. The rewards will compound in the farm and the strategy will continue to harvest whenever it is profitable or when a new deposit enters the vault.
+// 4. When harvested, the earned CHARM will be sold for equal parts USDC and USDT. 4.5% fees are taken, and the rest are reinvested into the LP. 
+//    The resulting LP tokens are staked into the farm.
+// 5. At any point in time, the user can withdraw from the vault. Since the vault has been autocompounding rewards, the mooBCT-USDC-SLP token will not be 1:1 with the SLP token.
 //    They'll get their share of whatever has built up over time.
 
-// Deployed Contract: https://polygonscan.com/address/0x1f9871133c8e093e9e1e2815ca76b75cc7bb8c11#readContract
+// Deployed Contract of Strategy: 
 
-contract StrategyPolygonSushiLP is StratManager, FeeManager {
+contract StrategyTelosOmnidexLP is StratManager, FeeManager {
     using SafeERC20 for IERC20;
     using SafeMath for uint256;
 
     // Tokens used
 
-    // Native token on Polygon is MATIC, but since it's not ERC-20 compliant, it is wrapped as WMATIC
+    // Native token on Telos is TLOS, wrapped version is WTLOS
+    // 0xD102cE6A4dB07D247fcc28F366A623Df0938CA9E
     address public native;
 
-    // Output token(s) - SUSHI/MATIC
+    // Output token(s) - CHARM token
+    // 0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df
     address public output;
 
-    // sushiswapLP - USDC/BCT
+    // OmniDexLP - USDT/USDC LP
+    // 0x8805F519663E47aBd6adbA4303639f69e51fd112
     address public want;
 
-    // LP token 0 is USDC
+    // LP token 0 is USDT
+    // 0xefaeee334f0fd1712f9a8cc375f427d9cdd40d73
     address public lpToken0;
-
-    // LP token 1 is BCT 
+    
+    // LP token 1 is USDC
+    // 0x818ec0a7fe18ff94269904fced6ae3dae6d6dc0b
     address public lpToken1;
 
     // Third party contracts
 
-    // Address of MiniChefV2 - SushiSwap Liquidity Mining Contract deployed on Polygon
+    // Address of OmniDex - Liquidity Mining Contract deployed on TLOS
+    // 0x79f5A8BD0d6a00A41EA62cdA426CEf0115117a61
+    // It's called ZenMaster
     address public chef;
 
-    // Pool ID - 50
+    // Pool ID - ??
     uint256 public poolId;
 
     // timestamp of last harvest - "1646397335" - 3/4/22 4:35 AM
@@ -72,16 +73,20 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
     // Routes - the path for swapping -> first is input, last is output, and ordered in swap path
     // i.e. [SUSHI, WETH, USDC, BCT] => start with SUSHI, swap to WETH, USDC, output is BCT.
 
-    // SUSHI, WMATIC
+    // CHARM, WTLOS
+    // [0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df, 0xD102cE6A4dB07D247fcc28F366A623Df0938CA9E]
     address[] public outputToNativeRoute;
 
-    // WMATIC, SUSHI
+    // WTLOS, CHARM
+    // [0xD102cE6A4dB07D247fcc28F366A623Df0938CA9E, 0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df]
     address[] public nativeToOutputRoute;
 
-    // SUSHI, WETH, USDC
+    // CHARM, USDC, USDT
+    // [0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df, 0x818ec0a7fe18ff94269904fced6ae3dae6d6dc0b, 0xefaeee334f0fd1712f9a8cc375f427d9cdd40d73]
     address[] public outputToLp0Route;
 
-    // SUSHI, WETH, USDC, BCT
+    // CHARM, USDC
+    // [0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df, 0x818ec0a7fe18ff94269904fced6ae3dae6d6dc0b]
     address[] public outputToLp1Route;
 
     // event that harvest was completed and how much was harvested
@@ -94,42 +99,43 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
     event Withdraw(uint256 tvl);
 
     constructor(
-        // we want pair of USDC/BCT
+        // we want pair of USDT/USDC
         address _want,
 
-        // pool ID in sushi - 50
+        // pool ID in omnidex = 10
         uint256 _poolId,
 
-        // address of sushi chef on polygon
+        // address of zenmaster on telos
         address _chef,
 
-        // address of the beefy vault: https://polygonscan.com/address/0x90a7289a3aab4b070a2646dca757025ee84cf580#code
-        // 0x90A7289A3aAb4b070A2646DCa757025Ee84cF580
-        // BeefyVaultV6 - mooSushiUSDC-BCT
+        // address of the beefy vault: we need to deploy this
+        // BeefyVaultV6 - mooOmniUSDT-USDC
         address _vault,
 
-        // UniswapV2Router02 - sushiswap router on polygon:
-        // 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506
+        // UniswapV2Router02 - omnidex router on telos:
+        // 0xF9678db1CE83f6f51E5df348E2Cc842Ca51EfEc1
         address _unirouter,
 
-        // ???? Unsure - 0x10aee6b5594942433e7fc2783598c979b030ef3d
-        // no contract
+        // can just be an owner address if we are not using chainlink keepers
         address _keeper,
 
-        // StrategistBuyBack - 0x3E85701BA493b6F51d6c301b91b758EC8685fA3c
-        // Owner - 0x2C6bd2d42AaA713642ee7c6e83291Ca9F94832C6
+        // StrategistBuyBack -  
+        // Owner - same, just an address to collect fees
         address _strategist,
 
-        // address of the fee receiver
+        // address of the fee receiver - BIFI pool
         address _beefyFeeRecipient,
 
-        // SUSHI, WMATIC
+        // CHARM, WTLOS
+        // [0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df, 0xD102cE6A4dB07D247fcc28F366A623Df0938CA9E]
         address[] memory _outputToNativeRoute,
 
-        // SUSHI, WETH, USDC
+        // CHARM, USDC, USDT
+        // [0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df, 0x818ec0a7fe18ff94269904fced6ae3dae6d6dc0b, 0xefaeee334f0fd1712f9a8cc375f427d9cdd40d73]
         address[] memory _outputToLp0Route,
 
-        // SUSHI, WETH, USDC, BCT
+        // CHARM, USDC
+        // [0xd2504a02fABd7E546e41aD39597c377cA8B0E1Df, 0x818ec0a7fe18ff94269904fced6ae3dae6d6dc0b]
         address[] memory _outputToLp1Route
     ) public StratManager(_keeper, _strategist, _unirouter, _vault, _beefyFeeRecipient) {
         want = _want;
@@ -142,12 +148,12 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
         outputToNativeRoute = _outputToNativeRoute;
         
         // setup lp routing
-        lpToken0 = IUniswapV2Pair(want).token0();
+        lpToken0 = IOmnidexPair(want).token0();
         require(_outputToLp0Route[0] == output, "first != output");
         require(_outputToLp0Route[_outputToLp0Route.length - 1] == lpToken0, "last != lptoken0");
         outputToLp0Route = _outputToLp0Route;
 
-        lpToken1 = IUniswapV2Pair(want).token1();
+        lpToken1 = IOmnidexPair(want).token1();
         require(_outputToLp1Route[0] == output, "first != output");
         require(_outputToLp1Route[_outputToLp1Route.length - 1] == lpToken1, "last != lptoken1");
         outputToLp1Route = _outputToLp1Route;
@@ -161,18 +167,18 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
         _giveAllowances();
     }
 
-    // deposits full balance of SLP-USDC-BCT into the chef contract and specific pool
+    // deposits full balance of LP-USDT-USDC into the zenmaster contract and specific pool
     // emits event that the full balance has been deposited
     function deposit() public whenNotPaused {
 
-        // slp token is an erc20, we check the current balance for the strategy
-        uint256 wantBal = IERC20(want).balanceOf(address(this));
-
+        // lp token is an erc20, we check the current balance for the strategy
+        uint256 wantBal = IOmnidexERC20(want).balanceOf(address(this));
+z
         // if current balance in the strategy is greater than 0, deposit the full balance into 
-        // sushi farm. we gave the approval to chef for the slp token in the constructor
+        // omnidex farm. we gave the approval to chef for the slp token in the constructor
         if (wantBal > 0) {
-            // sushi interface deposit into the given pool, the full balance, from this address
-            IMiniChefV2(chef).deposit(poolId, wantBal, address(this));
+            // omnidex interface deposit into the given pool, the full balance
+            IZenMaster(chef).deposit(poolId, wantBal);
             
             // emits the event of deposit completed
             emit Deposit(balanceOf());
@@ -191,9 +197,9 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
         // if not enough balance in strategy, we need to withdraw from the farm
         if (wantBal < _amount) {
             // withdraw from the pool, the amount minus however much strategy is holding at the moment
-            IMiniChefV2(chef).withdraw(poolId, _amount.sub(wantBal), address(this));
+            IZenMaster(chef).withdraw(poolId, _amount.sub(wantBal));
 
-            // want balance should be equal to the amount requested to withdraw now
+            // set want balance to balance in strategy
             wantBal = IERC20(want).balanceOf(address(this));
         }
 
@@ -241,8 +247,8 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
     // compounds earnings and charges performance fee
     function _harvest(address callFeeRecipient) internal whenNotPaused {
 
-        // call sushi farm to harvest the pool -> reward goes to the strategy contract
-        IMiniChefV2(chef).harvest(poolId, address(this));
+        // call farm to harvest the pool -> reward goes to the strategy contract -> harvest in omnidex is in deposit, so we deposit 0
+        IZenMaster(chef).deposit(poolId, 0);
         
         // output balance is the current balance of output (SUSHI token) in strategy
         uint256 outputBal = IERC20(output).balanceOf(address(this));
@@ -252,13 +258,13 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
             // charge and distribute the harvest fees among the caller, strategist, treasury, and stakers
             chargeFees(callFeeRecipient);
 
-            // add liquidity - what this does is swaps all output token (sushi) into  50% usdc, 50% bct, adds it all to the LP 
+            // add liquidity - what this does is swaps all output token (sushi) into  50% usdt, 50% usdc, adds it all to the LP 
             addLiquidity();
 
             // get the balance of slp token - should be increased after the liquidity adding above
             uint256 wantHarvested = balanceOfWant();
 
-            // deposit full balance of slp token into the farm
+            // deposit full balance of lp token into the farm
             deposit();
 
             // update last harvest time
@@ -271,31 +277,23 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
 
     // performance fees - some fees transferred to beefy recipient, some to strategist, and some to the harvest caller
     function chargeFees(address callFeeRecipient) internal {
-        // harvest comes in MATIC and SUSHI both, so swap the MATIC to sushi
-        
-        // start with getting the balance in MATIC of strategy
-        uint256 toOutput = IERC20(native).balanceOf(address(this));
 
-        // if balance of matic is greater than 0, swap all matic into sushi
-        if (toOutput > 0) {
-            // sushiswap router - swap WMATIC to SUSHI through the native to output route - deadline is now
-            IUniswapRouterETH(unirouter).swapExactTokensForTokens(toOutput, 0, nativeToOutputRoute, address(this), now);
-        }
-        
+        // All rewards come in CHARM
+
         // default of 4.5% fees of the harvest are taken 
-        // this comes from the output (SUSHI) and we multiply by 45/1000 (.045)
+        // this comes from the CHARM that we swap into WTLOS and we multiply by 45/1000 (.045)
 
         uint256 toNative = IERC20(output).balanceOf(address(this)).mul(45).div(1000);
 
-        // swapped from SUSHI to WMATIC -> then send the WMATIC to strategy address
-        IUniswapRouterETH(unirouter).swapExactTokensForTokens(toNative, 0, outputToNativeRoute, address(this), now);
+        // swap from CHARM to WTLOS -> then send the WTLOS to strategy address
+        IOmnidexRouter02(unirouter).swapExactTokensForTokens(toNative, 0, outputToNativeRoute, address(this), now);
 
-        // current balance of WMATIC on strategy
+        // current balance of WTLOS on strategy
         uint256 nativeBal = IERC20(native).balanceOf(address(this));
 
-        // caller of harvest gets their fee in WMATIC
-        uint256 callFeeAmount = nativeBal.mul(callFee).div(MAX_FEE);
-        IERC20(native).safeTransfer(callFeeRecipient, callFeeAmount);
+        // caller of harvest gets their fee in WTLOS
+        uint256 callFeeAmount = nativeBal.mul(callFeze).div(MAX_FEE);
+        IERC20(native).zsafeTransfer(callFeeRecipient, callFeeAmount);
 
         // 3% of harvest goes to the treasury, and to the BIFI stakers
         uint256 beefyFeeAmount = nativeBal.mul(beefyFee).div(MAX_FEE);
@@ -309,17 +307,17 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
     // Adds liquidity to AMM and gets more LP tokens.
     function addLiquidity() internal {
 
-        // calculates the output (SUSHI) balance on the strategy, and divides it by 2 since we'll split half USDC, half BCT
+        // calculates the output (CHARM) balance on the strategy, and divides it by 2 since we'll split half USDC, half BCT
         uint256 outputHalf = IERC20(output).balanceOf(address(this)).div(2);
 
-        // if the LP is not MATIC (which in this case it's USDC), swap using the route from WMATIC to USDC
+        // if the LP is not WTLOS (which in this case it's USDT), swap using the route from WTLOS to USDT
         if (lpToken0 != output) {
-            IUniswapRouterETH(unirouter).swapExactTokensForTokens(outputHalf, 0, outputToLp0Route, address(this), now);
+            IOmnidexRouter02(unirouter).swapExactTokensForTokens(outputHalf, 0, outputToLp0Route, address(this), now);
         }
 
-        // if the LP is not MATIC (which in this case it's BCT), swap using the route from WMATIC to BCT
+        // if the LP is not WTLOS (which in this case it's USDC), swap using the route from WTLOS to USDC
         if (lpToken1 != output) {
-            IUniswapRouterETH(unirouter).swapExactTokensForTokens(outputHalf, 0, outputToLp1Route, address(this), now);
+            IOmnidexRouter02(unirouter).swapExactTokensForTokens(outputHalf, 0, outputToLp1Route, address(this), now);
         }
 
         uint256 lp0Bal = IERC20(lpToken0).balanceOf(address(this));
@@ -341,32 +339,13 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
 
     // it calculates how much 'want' the strategy has working in the farm.
     function balanceOfPool() public view returns (uint256) {
-        (uint256 _amount, ) = IMiniChefV2(chef).userInfo(poolId, address(this));	
+        (uint256 _amount, ) = IZenMaster(chef).userInfo(poolId, address(this));	
         return _amount;
     }
 
     // returns rewards unharvested
     function rewardsAvailable() public view returns (uint256) {
-        return IMiniChefV2(chef).pendingSushi(poolId, address(this));
-    }
-
-    // native reward amount for calling harvest
-    function callReward() public view returns (uint256) {
-        uint256 nativeOut;
-        address rewarder = IMiniChefV2(chef).rewarder(poolId);
-        if (rewarder != address(0)) {
-            nativeOut = IRewarder(rewarder).pendingToken(poolId, address(this));
-        }
-
-        uint256 outputBal = rewardsAvailable();
-        try IUniswapRouterETH(unirouter).getAmountsOut(outputBal, outputToNativeRoute)
-                returns (uint256[] memory amountOut)
-            {
-                nativeOut += amountOut[amountOut.length -1];
-            }
-            catch {}
-
-        return nativeOut.mul(45).div(1000).mul(callFee).div(MAX_FEE);
+        return IZenMaster(chef).pendingCharm(poolId, address(this));
     }
 
     // if harvest on deposit is true, withdraw is free - if it's not true, withdrawal has a fee
@@ -384,7 +363,7 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
     function retireStrat() external {
         require(msg.sender == vault, "!vault");
 
-        IMiniChefV2(chef).emergencyWithdraw(poolId, address(this));
+        IZenMaster(chef).emergencyWithdraw(poolId);
 
         uint256 wantBal = IERC20(want).balanceOf(address(this));
         IERC20(want).transfer(vault, wantBal);
@@ -447,5 +426,5 @@ contract StrategyPolygonSushiLP is StratManager, FeeManager {
 
     function outputToLp1() external view returns (address[] memory) {
         return outputToLp1Route;
-    }
+    }z
 }
